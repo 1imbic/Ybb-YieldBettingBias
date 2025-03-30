@@ -105,7 +105,7 @@ def fetch_team_odds(config, urls=None, force_refresh=False, max_attempts=3):
     从网络获取比赛赔率数据:
     1. 使用Selenium访问网页获取比赛信息
     2. 提取队伍名称、赔率和比赛时间
-    3. 将数据保存到SQLite数据库
+    3. 将数据保存到SQLite数据库web_matches.db
     4. 返回新获取的比赛数据
     """
     if urls is None:
@@ -113,7 +113,7 @@ def fetch_team_odds(config, urls=None, force_refresh=False, max_attempts=3):
     all_new_matches = []
 
     for game_name, url in urls.items():
-        print(f"[网络] [{game_name}] 开始抓取数据，URL: {url}, 强制刷新: {force_refresh}")
+        print(f"[网络] [{game_name}] 开始抓取数据，URL: {url}")
         
         # 检查缓存，减少重复请求
         if not force_refresh and url in cache:
@@ -131,23 +131,54 @@ def fetch_team_odds(config, urls=None, force_refresh=False, max_attempts=3):
         match_folder = os.path.join(game_folder, match_name)
         os.makedirs(match_folder, exist_ok=True)
         
-        # 数据库文件路径
-        db_path = os.path.join(match_folder, "matches.db")
-        print(f"[网络] [{game_name}] 数据库路径: {db_path}")
+        # 网络数据库文件路径，改名为web_matches.db
+        db_path = os.path.join(match_folder, "web_matches.db")
+        
+        # 检查是否存在旧的matches.db文件，如果有则迁移数据
+        old_db_path = os.path.join(match_folder, "matches.db")
+        if os.path.exists(old_db_path) and not os.path.exists(db_path):
+            print(f"[网络] [{game_name}] 发现旧的数据库文件，正在迁移数据...")
+            try:
+                import shutil
+                shutil.copy2(old_db_path, db_path)
+                print(f"[网络] [{game_name}] 数据迁移成功")
+            except Exception as e:
+                print(f"[网络] [{game_name}] 数据迁移失败: {e}")
 
         # 初始化数据库
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS matches (
-            match_id TEXT PRIMARY KEY,
-            match_name TEXT,
-            match_time TEXT,
-            team_a TEXT,
-            team_b TEXT,
-            odds_a REAL,
-            odds_b REAL
-        )''')
-        conn.commit()
+        
+        # 确保表结构包含source字段
+        try:
+            cursor.execute("SELECT source FROM matches LIMIT 1")
+        except sqlite3.OperationalError:
+            # source列不存在，添加它并创建表结构
+            cursor.execute('''CREATE TABLE IF NOT EXISTS matches (
+                match_id TEXT PRIMARY KEY,
+                match_name TEXT,
+                match_time TEXT,
+                team_a TEXT,
+                team_b TEXT,
+                odds_a REAL,
+                odds_b REAL,
+                source TEXT
+            )''')
+            conn.commit()
+            print(f"[网络] [{game_name}] 创建包含source字段的表结构")
+        else:
+            # 表结构已存在且包含source字段
+            cursor.execute('''CREATE TABLE IF NOT EXISTS matches (
+                match_id TEXT PRIMARY KEY,
+                match_name TEXT,
+                match_time TEXT,
+                team_a TEXT,
+                team_b TEXT,
+                odds_a REAL,
+                odds_b REAL,
+                source TEXT
+            )''')
+            conn.commit()
 
         # 初始化WebDriver
         driver = setup_driver()
@@ -164,12 +195,10 @@ def fetch_team_odds(config, urls=None, force_refresh=False, max_attempts=3):
             try:
                 # 加载页面
                 driver.get(url)
-                print(f"[网络] [{game_name}] 等待页面加载，超时时间: 60秒")
                 WebDriverWait(driver, 60).until(
                     EC.presence_of_all_elements_located((By.TAG_NAME, "body"))
                 )
                 # 延长等待时间，确保动态内容加载完成
-                print(f"[网络] [{game_name}] 页面基本元素已加载，额外等待10秒确保动态内容加载")
                 time.sleep(10)
 
                 # 检查页面错误
@@ -181,38 +210,7 @@ def fetch_team_odds(config, urls=None, force_refresh=False, max_attempts=3):
                 # 查找赔率按钮和时间元素
                 odd_buttons = driver.find_elements(By.CSS_SELECTOR, '[data-test^="odd-button"]')
                 time_elements = driver.find_elements(By.CSS_SELECTOR, 'div.text-sm.text-grey-500, div.text-sm.text-grey-500.opacity-100')
-                print(f"[网络] [{game_name}] 找到 {len(odd_buttons)} 个赔率按钮，{len(time_elements)} 个时间元素")
                 
-                # 详细打印时间元素内容
-                if time_elements:
-                    print(f"[网络] [{game_name}] 时间元素详情:")
-                    for i, time_elem in enumerate(time_elements):
-                        try:
-                            text = time_elem.text.strip()
-                            print(f"[网络] [{game_name}] - 时间元素 {i+1}: '{text}'")
-                        except:
-                            print(f"[网络] [{game_name}] - 时间元素 {i+1}: 无法获取文本")
-                else:
-                    print(f"[网络] [{game_name}] 未找到任何时间元素")
-                
-                # 详细打印赔率按钮信息
-                if odd_buttons:
-                    print(f"[网络] [{game_name}] 赔率按钮详情:")
-                    data_labels = set()
-                    for i, button in enumerate(odd_buttons[:5]):  # 只打印前5个按钮以避免过多日志
-                        try:
-                            label = button.get_attribute('data-label')
-                            title = button.find_element(By.CSS_SELECTOR, '[data-test="odd-button__title"]').text.strip()
-                            result = button.find_element(By.CSS_SELECTOR, '[data-test="odd-button__result"]').text.strip()
-                            print(f"[网络] [{game_name}] - 按钮 {i+1}: 标签='{label}', 标题='{title}', 结果='{result}'")
-                            if label:
-                                data_labels.add(label.split('~')[0] if '~' in label else label)
-                        except Exception as e:
-                            print(f"[网络] [{game_name}] - 按钮 {i+1}: 获取信息失败: {e}")
-                    print(f"[网络] [{game_name}] 找到 {len(data_labels)} 个不同的比赛ID: {data_labels}")
-                else:
-                    print(f"[网络] [{game_name}] 未找到任何赔率按钮")
-
                 # 处理赔率按钮，提取队伍和赔率
                 match_data = {}
                 for button in odd_buttons:
@@ -239,39 +237,15 @@ def fetch_team_odds(config, urls=None, force_refresh=False, max_attempts=3):
                     except Exception as e:
                         print(f"[网络] [{game_name}] 处理赔率按钮时出错: {e}")
 
-                # 分析匹配结果
-                print(f"[网络] [{game_name}] 处理完成，获取到 {len(match_data)} 个比赛数据")
-                for match_id, data in match_data.items():
-                    print(f"[网络] [{game_name}] - 比赛ID: {match_id}")
-                    print(f"[网络] [{game_name}]   队伍A: {data['team_a']}, 赔率: {data['team_a_odds']}")
-                    print(f"[网络] [{game_name}]   队伍B: {data['team_b']}, 赔率: {data['team_b_odds']}")
-                
+                # 汇总打印比赛数据
+                print(f"[网络] [{game_name}] 找到 {len(match_data)} 场比赛")
                 if not match_data:
                     print(f"[网络] [{game_name}] 无有效数据")
-                    print(f"[网络] [{game_name}] 尝试分析页面结构以查找问题")
-                    try:
-                        # 尝试其他选择器
-                        alternative_buttons = driver.find_elements(By.CSS_SELECTOR, '.odd-button')
-                        print(f"[网络] [{game_name}] 替代选择器找到 {len(alternative_buttons)} 个按钮")
-                        
-                        # 检查页面主要内容
-                        main_content = driver.find_elements(By.CSS_SELECTOR, 'main')
-                        print(f"[网络] [{game_name}] 页面主要内容区域数量: {len(main_content)}")
-                        
-                        # 检查是否有加载动画
-                        loaders = driver.find_elements(By.CSS_SELECTOR, '.loader, .loading, .spinner')
-                        if loaders:
-                            print(f"[网络] [{game_name}] 发现 {len(loaders)} 个加载指示器，页面可能未加载完成")
-                        
-                        # 截取一部分HTML用于调试
-                        html_sample = driver.page_source[:1000] + "..." if len(driver.page_source) > 1000 else driver.page_source
-                        print(f"[网络] [{game_name}] 页面HTML样本: {html_sample}")
-                    except Exception as e:
-                        print(f"[网络] [{game_name}] 分析页面结构时出错: {e}")
                     continue
 
                 # 处理每个比赛数据
                 new_matches = []
+                match_summary = []
                 for i, (match_id, data) in enumerate(match_data.items()):
                     time_div = time_elements[i] if i < len(time_elements) else None
                     match_time, special_info = parse_time_element(time_div) if time_div else (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), None)
@@ -280,22 +254,37 @@ def fetch_team_odds(config, urls=None, force_refresh=False, max_attempts=3):
 
                     # 检查数据完整性
                     if not all([data["team_a"], data["team_b"], data["team_a_odds"], data["team_b_odds"]]):
-                        print(f"[网络] [{game_name}] 跳过不完整数据: {match_id}")
                         continue
 
-                    # 保存到数据库
-                    cursor.execute("SELECT match_id FROM matches WHERE match_id = ?", (match_id,))
-                    if cursor.fetchone():
-                        cursor.execute('''UPDATE matches SET match_name = ?, match_time = ?, team_a = ?, team_b = ?, odds_a = ?, odds_b = ?
-                            WHERE match_id = ?''', (match_name, match_time, data["team_a"], data["team_b"], float(data["team_a_odds"]), float(data["team_b_odds"]), match_id))
-                        print(f"[网络] [{game_name}] 更新比赛数据: {match_id}")
+                    # 使用带前缀的ID，确保web数据ID与小黑盒数据ID不冲突
+                    web_match_id = f"web_{match_id}"
+                    
+                    # 保存到web_matches.db，确保标记来源为web
+                    cursor.execute("SELECT match_id FROM matches WHERE match_id = ?", (web_match_id,))
+                    existing = cursor.fetchone()
+                    if existing:
+                        # 更新已有记录，包括所有信息（网站数据应完全更新，包括赔率）
+                        cursor.execute('''UPDATE matches SET 
+                            match_name = ?, match_time = ?, team_a = ?, team_b = ?, 
+                            odds_a = ?, odds_b = ?, source = ?
+                            WHERE match_id = ?''', 
+                            (match_name, match_time, data["team_a"], data["team_b"], 
+                            float(data["team_a_odds"]), float(data["team_b_odds"]), 
+                            "web", web_match_id))
+                        print(f"[网络] [{game_name}] 更新web记录: {web_match_id}")
                     else:
-                        cursor.execute('''INSERT INTO matches (match_id, match_name, match_time, team_a, team_b, odds_a, odds_b)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)''', (match_id, match_name, match_time, data["team_a"], data["team_b"], float(data["team_a_odds"]), float(data["team_b_odds"])))
-                        print(f"[网络] [{game_name}] 插入新比赛数据: {match_id}")
+                        # 插入新记录，标记来源为web
+                        cursor.execute('''INSERT INTO matches (
+                            match_id, match_name, match_time, team_a, team_b, 
+                            odds_a, odds_b, source)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', 
+                            (web_match_id, match_name, match_time, data["team_a"], data["team_b"], 
+                            float(data["team_a_odds"]), float(data["team_b_odds"]), "web"))
+                        print(f"[网络] [{game_name}] 创建新web记录: {web_match_id}")
+                        
                         # 添加到新比赛列表
                         new_matches.append({
-                            "MatchID": match_id,
+                            "MatchId": web_match_id,
                             "MatchName": match_name,
                             "MatchTime": match_time,
                             "TeamA": data["team_a"],
@@ -303,12 +292,22 @@ def fetch_team_odds(config, urls=None, force_refresh=False, max_attempts=3):
                             "TeamA_Odds": data["team_a_odds"],
                             "TeamB_Odds": data["team_b_odds"]
                         })
+                        
+                        # 收集信息用于汇总
+                        match_summary.append(f"{data['team_a']}({data['team_a_odds']}) vs {data['team_b']}({data['team_b_odds']}), 时间: {match_time}")
 
                 conn.commit()
                 cache[url] = new_matches  # 更新缓存
                 all_new_matches.extend(new_matches)
                 success = True
-                print(f"[网络] [{game_name}] 数据抓取成功，新增 {len(new_matches)} 场比赛")
+                
+                # 汇总打印比赛信息
+                if match_summary:
+                    print(f"[网络] [{game_name}] 获取到 {len(match_summary)} 场比赛:")
+                    for i, summary in enumerate(match_summary):
+                        print(f"[网络] [{game_name}] {i+1}. {summary}")
+                else:
+                    print(f"[网络] [{game_name}] 未获取到新比赛数据")
 
             except TimeoutException:
                 print(f"[网络] [{game_name}] 第 {attempt} 次页面加载超时")

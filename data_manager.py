@@ -101,13 +101,16 @@ class DataManager:
         return match_name, processed_data
 
     def save_to_sqlite(self, event_name, match_name, data, match_id=None):
-        """保存数据到 SQLite 文件"""
-        print(f"[数据保存] 开始保存: 事件='{event_name}', 比赛='{match_name}'")
+        """保存数据到 SQLite 文件，将小黑盒数据保存到lbb_matches.db，完全隔离于web_matches.db"""
+        print(f"[数据保存] 开始保存小黑盒数据: 事件='{event_name}', 比赛='{match_name}'")
         
         if not data or not match_name:
             print("[数据保存] 没有数据或比赛名称，跳过")
             return None
 
+        # 如果数据中包含原始名称，优先使用它查询映射
+        original_match_name = data.get("original_match_name", match_name)
+        
         # 清理比赛名称中的非法字符，以便用作目录名
         safe_match_name = re.sub(r'[<>:"/\\|?*]', '_', match_name)
         
@@ -116,66 +119,92 @@ class DataManager:
         game_folder = os.path.join(match_data_dir, event_name)
         os.makedirs(game_folder, exist_ok=True)
         
-        # 检查是否存在映射关系
+        # 检查映射关系以决定如何保存数据
+        mapping_found = False
+        mapped_name = None
         db_path = os.path.join(game_folder, 'mappings.db')
+        
         if os.path.exists(db_path):
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
-            cursor.execute('SELECT web_match_name FROM match_name_mapping WHERE lbb_match_name = ? AND game_name = ?', 
-                         (match_name, event_name))
-            mapping = cursor.fetchone()
-            conn.close()
             
-            if not mapping:
-                print(f"[数据保存] 未找到比赛名称映射，跳过: {match_name}")
-                return None
+            # 首先查询原始名称的映射
+            cursor.execute('SELECT web_match_name FROM match_name_mapping WHERE lbb_match_name = ? AND game_name = ?', 
+                         (original_match_name, event_name))
+            mapping = cursor.fetchone()
+            
+            if mapping and mapping[0] and not mapping[0].startswith("UNMATCHED_") and not mapping[0] == "TIME_DIFF_TOO_LARGE":
+                mapped_name = mapping[0]
+                mapping_found = True
+                print(f"[数据保存] 找到有效映射: {original_match_name} -> {mapped_name}")
+            else:
+                # 如果原始名称没有映射，检查标准化名称是否已经是标准名称
+                cursor.execute('SELECT 1 FROM match_name_mapping WHERE web_match_name = ? AND game_name = ?', 
+                            (match_name, event_name))
+                is_standard_name = cursor.fetchone() is not None
+                
+                if is_standard_name:
+                    mapped_name = match_name
+                    mapping_found = True
+                    print(f"[数据保存] 使用标准化名称: {match_name}")
+                else:
+                    print(f"[数据保存] 未找到映射，使用默认路径保存: {match_name}")
+            
+            conn.close()
         
-        # 创建比赛名称对应的目录
-        match_folder = os.path.join(game_folder, safe_match_name)
+        # 确定目标文件夹
+        if mapping_found and mapped_name:
+            # 使用映射的标准名称作为目录
+            safe_match_name = re.sub(r'[<>:"/\\|?*]', '_', mapped_name)
+            match_folder = os.path.join(game_folder, safe_match_name)
+        else:
+            # 直接使用传入的match_name作为目录
+            match_folder = os.path.join(game_folder, safe_match_name)
+        
         os.makedirs(match_folder, exist_ok=True)
         
-        # 保存到 matches.db
-        db_path = os.path.join(match_folder, "matches.db")
+        # 获取当前保存时间
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        # 保存原始数据
+        original_team_a = data.get("original_team_a", data["team_a"])
+        original_team_b = data.get("original_team_b", data["team_b"])
         
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS matches (
-                match_id TEXT PRIMARY KEY,
-                match_name TEXT,
-                match_time TEXT,
-                team_a TEXT,
-                team_b TEXT,
-                odds_a REAL,
-                odds_b REAL
-            )
-        """)
-
-        if match_id is None:
-            match_id = f"{event_name}_{safe_match_name}_{data['time'].replace(':', '').replace(' ', '')}"
-
-        cursor.execute("SELECT match_id FROM matches WHERE match_id = ?", (match_id,))
-        existing = cursor.fetchone()
-        if existing:
-            cursor.execute("""
-                UPDATE matches SET odds_a = ?, odds_b = ?, match_time = ?, match_name = ?, team_a = ?, team_b = ?
-                WHERE match_id = ?
-            """, (data["odds_a"], data["odds_b"], data["time"], match_name, data["team_a"], data["team_b"], match_id))
-        else:
-            cursor.execute("""
-                INSERT INTO matches (match_id, match_name, match_time, team_a, team_b, odds_a, odds_b)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (match_id, match_name, data["time"], data["team_a"], data["team_b"], data["odds_a"], data["odds_b"]))
-
-        conn.commit()
-        conn.close()
-        
-        # 保存到 lbb_matches.db
+        # 先在lbb_matches.db中检查是否有相似比赛（通过队伍和时间）
         lbb_db_path = os.path.join(match_folder, "lbb_matches.db")
+        if os.path.exists(lbb_db_path):
+            conn = sqlite3.connect(lbb_db_path)
+            cursor = conn.cursor()
+            
+            # 提取比赛日期用于模糊匹配
+            match_date = data["time"].split(" ")[0]  # 只使用日期部分，如 "2023-05-20"
+            
+            # 查询有没有同一天同两支队伍的比赛（忽略队伍顺序）
+            cursor.execute("""
+                SELECT match_id FROM matches 
+                WHERE match_time LIKE ? AND 
+                      ((team_a = ? AND team_b = ?) OR 
+                       (team_a = ? AND team_b = ?))
+            """, (f"{match_date}%", data["team_a"], data["team_b"], 
+                  data["team_b"], data["team_a"]))
+            
+            match_row = cursor.fetchone()
+            if match_row and match_id is None:
+                match_id = match_row[0]
+                print(f"[数据保存] 找到时间和队伍匹配的记录，使用其ID: {match_id}")
+            
+            conn.close()
         
+        # 生成唯一ID如果仍未提供或找到
+        if match_id is None:
+            match_id = f"lbb_{event_name}_{safe_match_name}_{data['time'].replace(':', '').replace(' ', '')}"
+            print(f"[数据保存] 生成新LBB数据ID: {match_id}")
+        
+        # 无论如何，保存小黑盒数据到lbb_matches.db
         conn = sqlite3.connect(lbb_db_path)
         cursor = conn.cursor()
+        
+        # 确保表结构包含last_updated字段
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS matches (
                 match_id TEXT PRIMARY KEY,
@@ -184,25 +213,114 @@ class DataManager:
                 team_a TEXT,
                 team_b TEXT,
                 odds_a REAL,
-                odds_b REAL
+                odds_b REAL,
+                original_match_name TEXT,
+                original_team_a TEXT,
+                original_team_b TEXT,
+                last_updated TEXT
             )
         """)
         
         cursor.execute("SELECT match_id FROM matches WHERE match_id = ?", (match_id,))
         existing = cursor.fetchone()
+        
         if existing:
             cursor.execute("""
-                UPDATE matches SET odds_a = ?, odds_b = ?, match_time = ?, match_name = ?, team_a = ?, team_b = ?
+                UPDATE matches SET 
+                    odds_a = ?, odds_b = ?, match_time = ?, match_name = ?, 
+                    team_a = ?, team_b = ?, original_match_name = ?,
+                    original_team_a = ?, original_team_b = ?, last_updated = ?
                 WHERE match_id = ?
-            """, (data["odds_a"], data["odds_b"], data["time"], match_name, data["team_a"], data["team_b"], match_id))
+            """, (data["odds_a"], data["odds_b"], data["time"], match_name, 
+                 data["team_a"], data["team_b"], original_match_name,
+                 original_team_a, original_team_b, now, match_id))
+            print(f"[数据保存] 更新LBB记录: {match_id}")
         else:
             cursor.execute("""
-                INSERT INTO matches (match_id, match_name, match_time, team_a, team_b, odds_a, odds_b)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (match_id, match_name, data["time"], data["team_a"], data["team_b"], data["odds_a"], data["odds_b"]))
-            
+                INSERT INTO matches (
+                    match_id, match_name, match_time, team_a, team_b, 
+                    odds_a, odds_b, original_match_name, original_team_a, 
+                    original_team_b, last_updated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (match_id, match_name, data["time"], data["team_a"], data["team_b"], 
+                 data["odds_a"], data["odds_b"], original_match_name, 
+                 original_team_a, original_team_b, now))
+            print(f"[数据保存] 创建新LBB记录: {match_id}")
+        
         conn.commit()
         conn.close()
-        print(f"[数据保存] 完成保存: {match_name}")
+        print(f"[数据保存] 完成LBB数据保存: {match_name}")
+        
+        # 如果没有找到映射，则还需要保存到默认数据库
+        if not mapping_found:
+            default_db_path = os.path.join(game_folder, "default_lbb_matches.db")
+            conn = sqlite3.connect(default_db_path)
+            cursor = conn.cursor()
+            
+            # 确保表结构包含last_updated字段
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS matches (
+                    match_id TEXT PRIMARY KEY,
+                    match_name TEXT,
+                    match_time TEXT,
+                    team_a TEXT,
+                    team_b TEXT,
+                    odds_a REAL,
+                    odds_b REAL,
+                    original_match_name TEXT,
+                    original_team_a TEXT,
+                    original_team_b TEXT,
+                    creation_time TEXT,
+                    last_updated TEXT
+                )
+            """)
+            
+            # 检查是否已存在记录
+            cursor.execute("SELECT match_id FROM matches WHERE match_id = ?", (match_id,))
+            existing = cursor.fetchone()
+            
+            # 如果未找到精确匹配，尝试查找相似记录
+            if not existing:
+                match_date = data["time"].split(" ")[0]
+                cursor.execute("""
+                    SELECT match_id FROM matches 
+                    WHERE match_time LIKE ? AND 
+                          ((team_a = ? AND team_b = ?) OR 
+                           (team_a = ? AND team_b = ?))
+                """, (f"{match_date}%", data["team_a"], data["team_b"], 
+                      data["team_b"], data["team_a"]))
+                similar_match = cursor.fetchone()
+                if similar_match:
+                    existing = similar_match
+                    print(f"[数据保存] 找到相似的默认数据库记录: {existing[0]}")
+            
+            if existing:
+                # 更新已有记录
+                cursor.execute("""
+                    UPDATE matches SET 
+                        odds_a = ?, odds_b = ?, match_time = ?, match_name = ?, 
+                        team_a = ?, team_b = ?, original_match_name = ?,
+                        original_team_a = ?, original_team_b = ?, last_updated = ?
+                    WHERE match_id = ?
+                """, (data["odds_a"], data["odds_b"], data["time"], match_name, 
+                     data["team_a"], data["team_b"], original_match_name,
+                     original_team_a, original_team_b, now, existing[0]))
+                print(f"[数据保存] 更新默认数据库记录: {existing[0]}")
+            else:
+                # 插入新记录
+                cursor.execute("""
+                    INSERT INTO matches (
+                        match_id, match_name, match_time, team_a, team_b, 
+                        odds_a, odds_b, original_match_name, original_team_a, 
+                        original_team_b, creation_time, last_updated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (match_id, match_name, data["time"], data["team_a"], data["team_b"], 
+                     data["odds_a"], data["odds_b"], original_match_name, 
+                     original_team_a, original_team_b, now, now))
+                print(f"[数据保存] 创建新默认数据库记录: {match_id}")
+            
+            conn.commit()
+            conn.close()
+            print(f"[数据保存] 完成默认数据库处理: {event_name}/default_lbb_matches.db")
         
         return match_id

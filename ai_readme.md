@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-本项目是一个自动化数据收集系统，用于从小黑盒应用中获取电子竞技比赛的赔率数据。系统通过模拟器运行小黑盒应用，使用OCR技术识别界面内容，并与网络数据源进行匹配和整合。
+本项目是一个自动化数据收集系统，用于从小黑盒应用中获取电子竞技比赛的赔率数据。系统通过模拟器运行小黑盒应用，使用OCR技术识别界面内容，并与网络数据源进行匹配和整合。收集的数据经过处理后，可用于计算凯利公式和投注建议。
 
 ## 模块依赖关系
 
@@ -12,7 +12,8 @@ main.py
   ├── screen_manager.py
   ├── data_manager.py
   ├── fetch_odds.py
-  └── team_match.py
+  ├── team_match.py
+  └── kelly_calculator.py
 ```
 
 ## 运行流程详解
@@ -56,15 +57,16 @@ main.py
 
 - **文本处理**：解析从OCR获取的文本数据，提取比赛名称、队伍名称、赔率等信息
 - **时间解析**：将识别到的时间格式化为标准格式
-- **数据存储**：将处理后的数据保存到SQLite数据库
+- **数据存储**：将处理后的小黑盒数据保存到lbb_matches.db，与web数据完全隔离
+- **原始数据保留**：保存原始数据以便追踪和调试
 
 主要调用流程：
 1. `process_text_data()`：处理OCR文本，提取结构化信息
 2. `parse_extended_time()`：解析时间信息
-3. `save_to_sqlite()`：将数据保存到数据库
+3. `save_to_sqlite()`：将小黑盒数据仅保存到lbb_matches.db
 
 输入：OCR提取的文本数据
-输出：结构化的比赛数据，并存储到数据库
+输出：结构化的比赛数据，并根据匹配状态存储到不同数据库中
 
 ### 4. 网络数据获取 (fetch_odds)
 
@@ -72,31 +74,58 @@ main.py
 
 - **浏览器自动化**：使用Selenium控制浏览器访问网页
 - **数据提取**：从网页解析比赛信息、队伍名称和赔率
-- **数据存储**：将网络数据保存到SQLite数据库
+- **数据存储**：将网络数据保存到SQLite数据库web_matches.db，标记来源为"web"
 - **缓存机制**：使用TTLCache缓存请求结果，减少重复请求
+- **优化输出**：减少调试信息，汇总打印比赛数据
 
-主要函数 `fetch_team_odds()` 完成从配置的URL获取比赛数据的工作。
+主要函数 `fetch_team_odds()` 完成从配置的URL获取比赛数据的工作，失败时系统会尝试使用本地数据。网络数据被视为权威数据源，且仅保存在web_matches.db中与小黑盒数据完全隔离。
 
 输入：配置信息、URLs
-输出：网络获取的比赛数据
+输出：网络获取的比赛数据或本地加载的备用数据
 
 ### 5. 团队匹配 (team_match)
 
 `team_match.py` 负责匹配来自不同来源的队伍和比赛名称：
 
 - **初始化数据库**：创建或连接映射数据库
-- **队伍匹配**：使用模糊匹配算法匹配不同来源的队伍名称
-- **比赛匹配**：匹配不同来源的比赛名称
-- **数据替换**：用标准化的队伍和比赛名称替换原始名称
+- **队伍规范化**：去除前缀（如"Team"）并统一格式
+- **增强匹配算法**：支持多种匹配方式，包括首字母匹配、规范化匹配、包含关系匹配和相似度匹配
+- **记录匹配结果**：包括成功匹配和失败匹配，便于后续分析
+- **保留原始数据**：在数据替换过程中保留原始名称，便于追踪
 
 主要函数：
-- `match_teams_and_names()`：将网络数据与小黑盒数据中的队伍和比赛名称进行匹配
-- `replace_team_and_match_name()`：用标准名称替换原始名称
+- `fuzzy_match()`：增强的模糊匹配算法，支持多种匹配策略
+- `match_teams_and_names()`：尝试匹配队伍和比赛名称，并将结果存入映射数据库
+- `replace_team_and_match_name()`：根据映射关系替换原始名称，并保留原始数据
 
 输入：网络数据、小黑盒数据
-输出：名称映射关系和替换后的数据
+输出：名称映射关系和替换后的数据，包含原始数据引用
 
-### 6. 主流程 (main.py)
+### 6. 凯利计算器 (kelly_calculator)
+
+`kelly_calculator.py` 负责基于收集的赔率数据计算凯利值和投注建议：
+
+- **数据库读取**：从web_matches.db和lbb_matches.db读取两个来源的比赛和赔率数据
+- **比赛匹配**：基于比赛/队伍识别信息匹配来自不同来源的同一比赛数据
+- **凯利计算**：使用凯利公式计算最优投注比例
+- **COINS计算**：根据凯利值计算投注金额建议
+- **结果存储**：将计算结果保存到kelly_results.db
+
+主要函数：
+- `calculate_kelly()`：实现凯利公式 f* = (bp - q) / b，计算凯利值
+- `calculate_coins()`：基于凯利值计算投注金额建议
+- `get_match_data()`：从两个隔离的数据库中读取和匹配比赛数据
+- `save_kelly_data()`：将计算结果保存到数据库
+
+计算规则：
+- 凯利值范围限制在0到0.5之间
+- 凯利值低于0.02的投注机会被忽略
+- COINS = (凯利值 - 0.02) * 200，并四舍五入到最近的百位
+
+输入：两个独立数据库中的比赛赔率数据
+输出：凯利值和COINS值，保存到kelly_results.db
+
+### 7. 主流程 (main.py)
 
 `main.py` 协调整个系统的运行：
 
@@ -104,28 +133,31 @@ main.py
 2. **初始化系统**：调用 `InitManager` 初始化模拟器、ADB和OCR
 3. **导航到比赛界面**：通过 `ScreenManager` 导航到赛事中心
 4. **循环处理游戏项目**：对配置中的每个游戏项目执行以下步骤：
-   - 获取网络数据（`fetch_team_odds`）
+   - 获取网络数据（`fetch_team_odds`）至web_matches.db
    - 获取小黑盒界面数据（`fetch_lbb_data`）
    - 匹配队伍和比赛名称（`match_teams_and_names`）
-   - 替换标准化名称（`replace_team_and_match_name`）
-   - 保存到数据库（`save_to_sqlite`）
+   - 替换标准化名称并保留原始数据（`replace_team_and_match_name`）
+   - 保存小黑盒数据到lbb_matches.db（`save_to_sqlite`）
+5. **计算凯利值**：收集完数据后，可以运行 `kelly_calculator.py` 计算凯利值和投注建议
 
 ## 数据流向
 
 1. 配置文件 → `InitManager` → 系统初始化
 2. 模拟器界面 → `ScreenManager` → OCR文本数据
-3. OCR文本数据 → `DataManager` → 结构化比赛数据
-4. 网页 → `fetch_odds` → 网络比赛数据
-5. 网络数据 + 小黑盒数据 → `team_match` → 标准化数据
-6. 标准化数据 → `DataManager` → SQLite数据库
+3. OCR文本数据 → `DataManager` → 结构化比赛数据 → lbb_matches.db
+4. 网页 → `fetch_odds` → 网络比赛数据 → web_matches.db
+5. 网络数据 + 小黑盒数据 → `team_match` → 标准化数据（含原始数据引用）
+6. 两个隔离数据库数据 → `KellyCalculator` → 凯利值和COINS投注建议
 
 ## 异常处理
 
 系统实现了多种异常处理机制：
-- 网络请求失败时，使用本地数据继续处理
+- 网络请求失败时尝试重试或加载缓存数据
 - OCR识别失败时，使用默认值或跳过处理
 - 界面导航失败时，重试或初始化系统
 - 数据处理异常时，记录错误并继续下一项处理
+- 匹配失败时，使用特殊前缀标记数据，便于后续分析
+- 凯利计算时，使用日志记录异常并跳过有问题的数据
 
 ## 配置文件结构
 
@@ -144,10 +176,12 @@ main.py
 ```
 data/
 └── CS2/                       # 游戏项目目录
-    ├── mappings.db           # 存储名称映射关系
-    └── blast_spring_2025/    # 比赛目录（使用URL提取的标准化名称）
-        ├── matches.db        # 网络数据
-        └── lbb_matches.db    # 小黑盒数据
+    ├── mappings.db            # 存储名称映射关系
+    ├── default_lbb_matches.db # 未匹配成功的小黑盒数据
+    ├── kelly_results.db       # 凯利计算结果
+    └── blast_spring_2025/     # 比赛目录（使用URL提取的标准化名称）
+        ├── web_matches.db     # 网络数据（严格隔离）
+        └── lbb_matches.db     # 小黑盒数据（严格隔离）
 ```
 
 ### 比赛名称处理
@@ -162,27 +196,86 @@ data/
 2. OCR识别的比赛名称
    - 从小黑盒界面识别（如 "2025BLAST春季公开赛BO3"）
    - 通过mappings.db映射到标准化名称
+   - 即使匹配失败，也保留原始名称用于追踪
 
 ### 数据库表结构
-1. matches表（同时适用于matches.db和lbb_matches.db）：
+
+1. web_matches.db表结构：
 ```sql
 CREATE TABLE matches (
-    match_id TEXT PRIMARY KEY,    -- 比赛唯一标识
+    match_id TEXT PRIMARY KEY,    -- 比赛唯一标识（使用web_前缀）
     match_name TEXT,             -- 比赛名称（标准化后的）
     match_time TEXT,             -- 比赛时间
-    team_a TEXT,                -- A队名称
-    team_b TEXT,                -- B队名称
+    team_a TEXT,                -- A队名称（标准化后的）
+    team_b TEXT,                -- B队名称（标准化后的）
     odds_a REAL,                -- A队赔率
-    odds_b REAL                 -- B队赔率
+    odds_b REAL,                -- B队赔率
+    source TEXT                 -- 数据来源标记（固定为"web"）
 )
 ```
 
-2. mappings.db中的表结构：
+2. lbb_matches.db表结构：
+```sql
+CREATE TABLE matches (
+    match_id TEXT PRIMARY KEY,     -- 比赛唯一标识（使用lbb_前缀）
+    match_name TEXT,              -- 比赛名称（标准化后的）
+    match_time TEXT,              -- 比赛时间
+    team_a TEXT,                 -- A队名称（标准化后的）
+    team_b TEXT,                 -- B队名称（标准化后的）
+    odds_a REAL,                 -- A队赔率
+    odds_b REAL,                 -- B队赔率
+    original_match_name TEXT,     -- 原始比赛名称
+    original_team_a TEXT,        -- 原始A队名称
+    original_team_b TEXT,        -- 原始B队名称
+    last_updated TEXT            -- 最近更新时间
+)
+```
+
+3. default_lbb_matches.db表结构：
+```sql
+CREATE TABLE matches (
+    match_id TEXT PRIMARY KEY,      -- 比赛唯一标识
+    match_name TEXT,               -- 比赛名称
+    match_time TEXT,               -- 比赛时间
+    team_a TEXT,                  -- A队名称
+    team_b TEXT,                  -- B队名称
+    odds_a REAL,                  -- A队赔率
+    odds_b REAL,                  -- B队赔率
+    original_match_name TEXT,      -- 原始比赛名称
+    original_team_a TEXT,         -- 原始A队名称
+    original_team_b TEXT,         -- 原始B队名称
+    creation_time TEXT,           -- 创建时间
+    last_updated TEXT             -- 最近更新时间
+)
+```
+
+4. kelly_results.db表结构：
+```sql
+CREATE TABLE kelly_results (
+    match_id TEXT PRIMARY KEY,     -- 比赛唯一标识
+    match_name TEXT,              -- 比赛名称
+    match_time TEXT,              -- 比赛时间
+    team_a TEXT,                 -- A队名称
+    team_b TEXT,                 -- B队名称
+    web_odds_a REAL,             -- 网站A队赔率
+    web_odds_b REAL,             -- 网站B队赔率
+    lbb_odds_a REAL,             -- 小黑盒A队赔率
+    lbb_odds_b REAL,             -- 小黑盒B队赔率
+    kelly_a REAL,                -- A队凯利值
+    kelly_b REAL,                -- B队凯利值
+    coins_a INTEGER,             -- A队COINS值
+    coins_b INTEGER,             -- B队COINS值
+    match_dir TEXT,              -- 比赛目录
+    calculation_time TEXT        -- 计算时间
+)
+```
+
+5. mappings.db中的表结构：
 ```sql
 -- 比赛名称映射表
 CREATE TABLE match_name_mapping (
     lbb_match_name TEXT,         -- OCR识别的比赛名称
-    web_match_name TEXT,         -- URL提取的标准化名称
+    web_match_name TEXT,         -- URL提取的标准化名称，可能有特殊前缀标记如UNMATCHED_
     game_name TEXT,             -- 游戏名称
     last_updated TEXT,          -- 更新时间
     PRIMARY KEY (lbb_match_name, game_name)
@@ -191,21 +284,31 @@ CREATE TABLE match_name_mapping (
 -- 队伍名称映射表
 CREATE TABLE team_mapping (
     lbb_team TEXT,              -- 小黑盒识别的队伍名称
-    web_team TEXT,              -- 网站获取的标准队伍名称
+    web_team TEXT,              -- 网站获取的标准队伍名称，可能有特殊前缀标记如UNCONFIRMED_
     game_name TEXT,             -- 游戏名称
     last_updated TEXT,          -- 更新时间
     PRIMARY KEY (lbb_team, game_name)
 )
 ```
 
-### 名称映射流程
-1. 比赛名称映射：
-   - 从URL提取标准化比赛名称
-   - OCR识别小黑盒界面获取比赛名称
-   - 将两者关系存储在mappings.db中
-   - 使用标准化名称创建比赛数据目录
+### 数据隔离策略
 
-2. 队伍名称映射：
-   - 根据比赛时间匹配网站和小黑盒的比赛数据
-   - 使用模糊匹配（首字母或相似度）确定队伍对应关系
-   - 将映射关系存储在mappings.db中
+1. 严格数据隔离：
+   - 网络数据和小黑盒数据严格隔离在不同数据库文件中
+   - 网络数据仅保存在web_matches.db（表示权威数据源）
+   - 小黑盒数据仅保存在lbb_matches.db
+   - 两者通过ID前缀（web_/lbb_）避免冲突
+
+2. 小黑盒数据流向：
+   - OCR识别 → 文本处理 → 标准化 → lbb_matches.db
+   - 匹配失败的数据 → default_lbb_matches.db
+   - 严格禁止小黑盒数据写入web_matches.db
+
+3. 网络数据流向：
+   - 网络爬取 → 标准化 → web_matches.db
+   - 旧的matches.db数据迁移至web_matches.db
+
+4. 凯利计算数据整合：
+   - 从两个独立数据库读取数据
+   - 基于队伍和比赛名称进行匹配
+   - 分别显示和使用两个来源的赔率数据
